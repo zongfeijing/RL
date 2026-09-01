@@ -149,9 +149,11 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     )
     thinking_tags = thinking_tags or DEFAULT_THINKING_TAGS
 
+    # A tool-call-only assistant turn carries content=None (OpenAI schema), so
+    # the key existing does not imply a sized container -- treat None like
+    # absent instead of crashing on len(None).
     is_output_message = (
-        "content" in output_item_dict
-        and len(output_item_dict["content"]) > 0
+        len(output_item_dict.get("content") or []) > 0
         and "text" in output_item_dict["content"][0]
     )
     # NeMo-Gym only attaches generation_token_ids to the last output item of a
@@ -160,7 +162,7 @@ def _detect_invalid_tool_call_and_malformed_thinking(
     # If it's a reasoning item, the model output only reasoning (no content/tool calls).
     is_reasoning_message = (
         output_item_dict.get("type") == "reasoning"
-        and len(output_item_dict.get("summary", [])) > 0
+        and len(output_item_dict.get("summary") or []) > 0
         and "text" in output_item_dict["summary"][0]
     )
 
