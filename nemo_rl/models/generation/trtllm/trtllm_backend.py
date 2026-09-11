@@ -200,6 +200,37 @@ class NcclExtension(WorkerExtension):
                 ) from error
 
     # ------------------------------------------------------------------ #
+    #  torch.compile refit lifecycle (TRT-LLM >= the unwrap-before-refit fix)
+    # ------------------------------------------------------------------ #
+    def _unwrap_compiled_model_for_refit(self, model_engine: Any) -> None:
+        """Drop the torch.compile wrapper before the weights are loaded.
+
+        torch.compile wraps the engine's ``llm.model`` in an OptimizedModule
+        whose child is ``_orig_mod``, so every parameter path under it gains
+        ``._orig_mod.`` while the trainer's keys do not; ``load_weights`` matches
+        by dotted path and, with ``allow_partial_loading=True``, silently skips
+        the whole compiled subtree -- the engine then generates from its
+        pre-refit (dummy) weights. TRT-LLM's own refit path unwraps first
+        (``unwrap_compiled_model_for_refit``) and its ``ModelLoader.reload``
+        now raises when a wrapper is still installed; call the same hook here.
+        No-op on TRT-LLM builds without the hook and when torch.compile is off.
+        """
+        unwrap = getattr(model_engine, "unwrap_compiled_model_for_refit", None)
+        if unwrap is not None:
+            unwrap()
+
+    def _restore_compiled_model_after_refit(self, model_engine: Any) -> None:
+        """Re-install the torch.compile wrapper after the weights are loaded.
+
+        TRT-LLM's hook only re-wraps: refit moves no tensor, so there is no
+        recompile and no piecewise CUDA graph recapture and the captures stay
+        hot. No-op without the hook / with torch.compile off.
+        """
+        restore = getattr(model_engine, "restore_compiled_model_after_refit", None)
+        if restore is not None:
+            restore(self.engine.resource_manager)
+
+    # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
 
@@ -252,6 +283,10 @@ class NcclExtension(WorkerExtension):
                 # iter is enqueued, but its GPU forward may still be in flight.
                 # Block here so we don't overwrite weights mid-forward
                 torch.cuda.synchronize()
+                # Unwrap torch.compile first: load_weights must see the
+                # unwrapped parameter paths (see _unwrap_compiled_model_for_refit).
+                self._unwrap_compiled_model_for_refit(model_engine)
+                model = model_engine.model
                 _call_model_loader_hook_if_available(
                     model_engine.model_loader, "begin_update_weights"
                 )
@@ -268,9 +303,18 @@ class NcclExtension(WorkerExtension):
                 )
                 self._finalize_weight_update()
                 torch.cuda.current_stream().synchronize()
+                self._restore_compiled_model_after_refit(model_engine)
 
                 self.engine.recompute_active_requests()
             except Exception as e:
+                try:
+                    # Best effort: never leave the engine permanently eager.
+                    self._restore_compiled_model_after_refit(model_engine)
+                except Exception as restore_error:
+                    print(
+                        "Error restoring the torch.compile wrapper after a failed "
+                        f"refit: {restore_error}"
+                    )
                 self._abort_weight_update_after_failure(
                     model, model_engine.model_loader, e
                 )
@@ -316,6 +360,9 @@ class NcclExtension(WorkerExtension):
         weights = None
         try:
             self.maybe_init_zmq()
+            torch.cuda.synchronize()
+            self._unwrap_compiled_model_for_refit(model_engine)
+            model = model_engine.model
             _call_model_loader_hook_if_available(
                 model_engine.model_loader, "begin_update_weights"
             )
@@ -382,11 +429,19 @@ class NcclExtension(WorkerExtension):
 
             self._finalize_weight_update()
             torch.cuda.current_stream().synchronize()
+            self._restore_compiled_model_after_refit(model_engine)
             self.engine.reset_prefix_cache()
             gc.collect()
             torch.cuda.empty_cache()
             return True
         except Exception as e:
+            try:
+                self._restore_compiled_model_after_refit(model_engine)
+            except Exception as restore_error:
+                print(
+                    "Error restoring the torch.compile wrapper after a failed "
+                    f"refit: {restore_error}"
+                )
             self._abort_weight_update_after_failure(
                 model, model_engine.model_loader, e
             )
