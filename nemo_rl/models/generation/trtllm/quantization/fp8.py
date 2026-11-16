@@ -38,6 +38,11 @@ ROUTED_EXPERTS_ONLY_IGNORE_PATTERNS = (
     "model.layers.*.linear_attn*",
     "model.layers.*.mlp.gate",
     "model.layers.*.mlp.shared_expert*",
+    # Dense MLP layers (GLM: the first layers have no experts) stay BF16.
+    "model.layers.*.mlp.gate_proj",
+    "model.layers.*.mlp.up_proj",
+    "model.layers.*.mlp.down_proj",
+    "model.layers.*.mlp.gate_up_proj",
     "model.embed_tokens",
     "model.norm",
     "lm_head",
@@ -197,7 +202,7 @@ def validate_fused_expert_layout(
 
 
 # HF ``model_type`` values whose routed-expert layout this refit path supports.
-SUPPORTED_MODEL_TYPES = ("qwen3_5_moe", "qwen3_moe")
+SUPPORTED_MODEL_TYPES = ("qwen3_5_moe", "qwen3_moe", "glm_moe_dsa")
 
 
 def validate_model_type(model_type: str) -> None:
@@ -229,12 +234,37 @@ def validate_routed_experts(state_dict_info: dict[str, Any]) -> None:
         )
     dense = [name for name in names if _DENSE_MLP_RE.fullmatch(name)]
     if dense:
-        raise ValueError(
-            "precision='fp8' quantizes only routed experts, but the model has "
-            f"dense MLP weights that would stay BF16 (e.g. {dense[0]})"
-        )
+        # Listed in ROUTED_EXPERTS_ONLY_IGNORE_PATTERNS: the engine keeps them BF16.
+        print(f"precision=fp8: {len(dense)} dense MLP weights stay BF16 (e.g. {dense[0]})")
     if has_fused:
         validate_fused_expert_layout(state_dict_info)
+
+
+def checkpoint_quant_config(model_dir: Any) -> Optional[dict[str, Any]]:
+    """The checkpoint's own block-FP8 quantization_config, or None.
+
+    A checkpoint released in 128x128 block FP8 lists the modules it keeps in
+    BF16. An engine refitted in that layout runs the configuration TRT-LLM
+    serves the released checkpoint with; the refit then quantizes every weight
+    that checkpoint quantizes, not only the routed experts.
+    """
+    import json
+    import os
+
+    if model_dir is None:
+        return None
+    try:
+        with open(os.path.join(str(model_dir), "config.json"), encoding="utf-8") as handle:
+            quant = json.load(handle).get("quantization_config")
+    except OSError:
+        return None
+    if not isinstance(quant, dict) or quant.get("quant_method") != "fp8":
+        return None
+    if list(quant.get("weight_block_size") or []) != list(FP8_BLOCK_SIZE):
+        return None
+    if not isinstance(quant.get("modules_to_not_convert"), list):
+        return None
+    return dict(quant)
 
 
 def configure_fp8_llm_kwargs(
@@ -247,6 +277,11 @@ def configure_fp8_llm_kwargs(
     Conflicting quantization or load-format overrides raise at setup.
     """
     base_kwargs = build_quant_config(is_mx)
+    checkpoint_kwargs = (
+        None if is_mx else checkpoint_quant_config(llm_kwargs.get("model"))
+    )
+    if checkpoint_kwargs is not None:
+        base_kwargs = checkpoint_kwargs
     label = "MXFP8" if is_mx else "block-FP8"
 
     model_kwargs = dict(llm_kwargs.get("model_kwargs") or {})
@@ -272,8 +307,9 @@ def configure_fp8_llm_kwargs(
     llm_kwargs["model_kwargs"] = model_kwargs
     llm_kwargs["load_format"] = "dummy"
     llm_kwargs["dtype"] = "bfloat16"
-    # Keep the block-FP8 Linear fallback on FP32 scales (not DeepGEMM's E8M0).
-    llm_kwargs["use_cute_dsl_blockscaling_mm"] = True
+    if checkpoint_kwargs is None:
+        # Keep the block-FP8 Linear fallback on FP32 scales (not DeepGEMM's E8M0).
+        llm_kwargs["use_cute_dsl_blockscaling_mm"] = True
 
 
 def configure_fp8_moe_backend(
