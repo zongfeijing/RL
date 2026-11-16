@@ -25,7 +25,10 @@ Injected into TRT-LLM's RayGPUWorker via ``ray_worker_extension_cls``.
 
 import gc
 import inspect
+import math
 import os
+import re
+import time
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -92,6 +95,14 @@ class NcclExtension(WorkerExtension):
     # the expert prefix -> MoE weight-owner module map (built once).
     _pending_bulk_reload: Optional[dict[str, Any]] = None
     _moe_weight_owner_map: Optional[dict[str, Any]] = None
+    # Models whose load_weights takes only a complete set of weights (GLM, DeepSeek V3):
+    # non-expert tensors wait here, in host memory, for one load at the end of the refit.
+    _staged_misc_weights: Optional[dict[str, Any]] = None
+    _direct_expert_tensors: int = 0
+    _expert_slot_checked: bool = False
+    _checkpoint_fp8_names: Optional[frozenset] = None
+    _refits_done: int = 0
+    _addresses_before: Optional[dict] = None
     # nccl_reshard env knobs, parsed in prepare_nccl_reshard_refit_info.
     # Converted bytes to accumulate before one ``model_loader.reload`` call:
     # every reload walks the whole module tree, so batching keeps that host cost
@@ -198,6 +209,13 @@ class NcclExtension(WorkerExtension):
                 # The device is already quiesced -- py_executor's
                 # _handle_control_request synchronizes before releasing the
                 # barrier control_action waits on.
+                if not self._partial_loading_supported():
+                    # The receive buffers (5 GiB each) need free device memory:
+                    # hand cached blocks back before the transfer starts.
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    # Before begin_weight_update: it re-creates parameters.
+                    self._addresses_before = self._tensor_addresses()
                 self.begin_weight_update()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -207,6 +225,9 @@ class NcclExtension(WorkerExtension):
                 )
                 self._finish_refit(recompute_kv)
             except Exception:
+                self._staged_misc_weights = None
+                self._direct_expert_tensors = 0
+                self._expert_slot_checked = False
                 self.engine.model_engine.model_loader.abort_update_weights()
                 raise
 
@@ -339,12 +360,16 @@ class NcclExtension(WorkerExtension):
     # ------------------------------------------------------------------ #
     def _finish_refit(self, recompute_kv: bool) -> None:
         """Finalize a refit inside control_action."""
+        self._flush_staged_weights()
         self.finalize_weight_update()
+        stale_graphs = self._release_graphs_if_tensors_moved()
         if recompute_kv:
             # Re-prefill in-flight requests under the new weights; this
             # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
             self.engine.recompute_active_requests()
         self.finish_weight_update()
+        if stale_graphs:
+            self._recapture_graphs()
 
     def _reload_bucket(self, weight_list) -> None:
         """Convert routed experts if the engine is FP8/MXFP8, then reload."""
@@ -359,11 +384,456 @@ class NcclExtension(WorkerExtension):
             )
         else:
             weights = dict(weight_list)
+        if not self._partial_loading_supported():
+            self._reload_bucket_staged(weights)
+            return
         model_engine.model_loader.reload(
             model,
             weights,
             allow_partial_loading=True,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Models without partial loading (GLM / DeepSeek V3 load path)
+    # ------------------------------------------------------------------ #
+    # TRT-LLM loads these models through DeepseekV3WeightLoader, which takes a
+    # complete set of weights only: ``model_loader.reload(...,
+    # allow_partial_loading=True)`` asserts for them. Routed experts (per-expert
+    # HF names) go straight into their MoE module, which does support partial
+    # loads; everything else is copied to host memory and loaded once, at the
+    # end of the refit, by the model's own loader with the expert modules skipped.
+    _SPLIT_EXPERT_KEY_RE = re.compile(
+        r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
+        r"(?P<projection>gate_proj|up_proj|down_proj)\."
+        r"(?P<leaf>weight|weight_scale_inv)$"
+    )
+    # HF projection name -> the name TRT-LLM's MoE modules load (the rename
+    # DeepseekV3WeightLoader applies before it calls the MoE module).
+    _EXPERT_PROJECTION_TO_MOE = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
+
+    def _partial_loading_supported(self) -> bool:
+        model = self.engine.model_engine.model
+        return (
+            "allow_partial_loading" in inspect.getfullargspec(model.load_weights).args
+        )
+
+    def _reload_bucket_staged(self, weights: dict) -> None:
+        """Load a bucket's routed experts now and keep the rest for the end."""
+        staged = self._staged_misc_weights
+        if staged is None:
+            staged = self._staged_misc_weights = {}
+        by_prefix: dict[str, dict[str, Any]] = {}
+        for name, tensor in weights.items():
+            match = self._SPLIT_EXPERT_KEY_RE.fullmatch(name)
+            if match is None:
+                self._probe_received(name, tensor, None)
+                if name in self._checkpoint_fp8_weights():
+                    # The engine is built in the released checkpoint's layout:
+                    # give the loader what that checkpoint would (FP8 + block scale).
+                    fp8_data, scale_inv = fp8_quantization.cast_tensor_to_fp8_blockwise(
+                        tensor
+                    )
+                    staged[name] = fp8_data.to("cpu")
+                    staged[name + "_scale_inv"] = scale_inv.to("cpu")
+                    continue
+                # A host copy: the received view would pin its GPU receive buffer.
+                staged[name] = tensor.detach().to("cpu", copy=True)
+                continue
+            if match["leaf"] == "weight":
+                self._probe_received(
+                    name, tensor, weights.get(name + "_scale_inv")
+                )
+            key = "{}.{}.{}".format(
+                match["expert"],
+                self._EXPERT_PROJECTION_TO_MOE[match["projection"]],
+                match["leaf"],
+            )
+            by_prefix.setdefault(match["prefix"], {})[key] = tensor
+        for prefix, module_weights in by_prefix.items():
+            module = self._moe_weight_owner(prefix)
+            module.load_weights(weights=[module_weights], allow_partial_loading=True)
+            if not self._expert_slot_checked:
+                self._expert_slot_checked = self._check_expert_slot(
+                    prefix, module, module_weights
+                )
+            self._direct_expert_tensors += len(module_weights)
+
+    # Tensors up to this size are kept alive across a refit so that a re-created
+    # one can be written back into the memory the CUDA graphs were captured on.
+    _PIN_MAX_ELEMENTS = 64 * 1024 * 1024
+
+    def _tensor_slots(self):
+        """Every parameter, buffer and tensor attribute: (key, module, kind, name, tensor)."""
+        for module_name, module in self.engine.model_engine.model.named_modules():
+            slots = [("p", name, value) for name, value in module._parameters.items()]
+            slots += [("b", name, value) for name, value in module._buffers.items()]
+            slots += [
+                ("a", name, value)
+                for name, value in vars(module).items()
+                if isinstance(value, torch.Tensor)
+            ]
+            for kind, name, tensor in slots:
+                if tensor is not None and tensor.numel() > 0:
+                    yield f"{module_name}.{name}", module, kind, name, tensor
+
+    def _tensor_addresses(self) -> dict:
+        """key -> (address, the tensor itself when it is small enough to keep)."""
+        return {
+            key: (
+                tensor.data_ptr(),
+                tensor if tensor.numel() <= self._PIN_MAX_ELEMENTS else None,
+            )
+            for key, _module, _kind, _name, tensor in self._tensor_slots()
+        }
+
+    def _release_graphs_if_tensors_moved(self) -> bool:
+        """Keep the CUDA graphs captured before the refit valid, or drop them.
+
+        TRT-LLM keeps its captured graphs across a refit on the assumption that a
+        refit moves no tensor. The DeepSeek V3 load path re-creates some (the
+        indexer's fused projection, the absorbed MLA value projection), and a
+        graph captured earlier keeps reading the old memory. A re-created tensor
+        of the same shape is copied back into the old one, which stays the live
+        tensor; if that is not possible for any of them, the graphs are released
+        and decoding runs without them.
+        """
+        before, self._addresses_before = self._addresses_before, None
+        if before is None:
+            return False
+        moved, kept_in_place, not_restorable = [], 0, []
+        total = 0
+        for key, module, kind, name, tensor in list(self._tensor_slots()):
+            total += 1
+            entry = before.get(key)
+            if entry is None or entry[0] == tensor.data_ptr():
+                continue
+            moved.append(key)
+            old = entry[1]
+            if (
+                old is None
+                or old.shape != tensor.shape
+                or old.dtype != tensor.dtype
+                or old.device != tensor.device
+            ):
+                not_restorable.append(key)
+                continue
+            with torch.no_grad():
+                old.copy_(tensor)
+            if kind == "p":
+                module._parameters[name] = old
+            elif kind == "b":
+                module._buffers[name] = old
+            else:
+                setattr(module, name, old)
+            kept_in_place += 1
+        print(
+            f"[refit] {len(moved)} of {total} model tensors were re-created by the "
+            f"refit; {kept_in_place} written back into their previous memory"
+            + (f", e.g. {moved[:4]}" if moved else "")
+            + (f"; NOT restorable: {not_restorable[:4]}" if not_restorable else ""),
+            flush=True,
+        )
+        if not not_restorable:
+            return False
+        model_engine = self.engine.model_engine
+        runner = model_engine.cuda_graph_runner
+        freed = 0
+        if runner is not None:
+            # clear() below only forgets the padding dummies; free them in the KV
+            # cache manager too, or a later capture cannot allocate them again.
+            from tensorrt_llm._torch.pyexecutor.resource_manager import (
+                ResourceManagerType,
+            )
+
+            kv_cache_manager = self.engine.resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            )
+            for cache in runner._padding_dummy_caches():
+                for request in list(cache.values()):
+                    kv_cache_manager.free_resources(request)
+                    freed += 1
+        model_engine._release_model_owned_cuda_graphs()
+        model_engine._release_cuda_graphs()
+        print(
+            "[refit] released the CUDA graphs captured before the refit "
+            f"({freed} padding dummies freed); decoding runs without graphs",
+            flush=True,
+        )
+        return True
+
+    def _recapture_graphs(self) -> None:
+        """Run the engine warm-up again so decoding gets CUDA graphs back.
+
+        Off unless NRL_TRTLLM_REFIT_RECAPTURE=1: the warm-up zero-fills the KV
+        pools, which is only safe when no request is kept across the refit.
+        """
+        if os.environ.get("NRL_TRTLLM_REFIT_RECAPTURE", "0") != "1":
+            return
+        try:
+            start = time.perf_counter()
+            self.engine.model_engine.warmup(self.engine.resource_manager)
+            print(
+                f"[refit] CUDA graphs recaptured in {time.perf_counter() - start:.1f} s",
+                flush=True,
+            )
+        except Exception as error:  # without graphs decoding is slower, not wrong
+            print(
+                "[refit] could not recapture CUDA graphs; decoding runs without "
+                f"them: {error!r}",
+                flush=True,
+            )
+
+    def _checkpoint_dir(self) -> Optional[str]:
+        llm_args = getattr(self.engine.model_engine.model_loader, "llm_args", None)
+        model_dir = getattr(llm_args, "model", None)
+        return None if model_dir is None else str(model_dir)
+
+    def _checkpoint_fp8_weights(self) -> frozenset:
+        """Names the released checkpoint stores in block FP8 (they have a scale).
+
+        Empty unless the engine was built in that checkpoint's own layout (see
+        fp8.checkpoint_quant_config): then non-expert weights are quantized the
+        same way before they reach the loader.
+        """
+        names = self._checkpoint_fp8_names
+        if names is not None:
+            return names
+        names = frozenset()
+        model = self.engine.model_engine.model
+        model_dir = self._checkpoint_dir()
+        if (
+            model_dir is not None
+            and fp8_quantization.is_fp8_model(model.model_config.quant_config)
+            and fp8_quantization.checkpoint_quant_config(model_dir) is not None
+        ):
+            import json
+
+            index_path = os.path.join(model_dir, "model.safetensors.index.json")
+            with open(index_path, encoding="utf-8") as handle:
+                weight_map = json.load(handle)["weight_map"]
+            suffix = "_scale_inv"
+            names = frozenset(
+                name[: -len(suffix)] for name in weight_map if name.endswith(suffix)
+            )
+            print(
+                f"[refit] engine uses the checkpoint's FP8 layout: {len(names)} "
+                "tensors are block FP8 there",
+                flush=True,
+            )
+        self._checkpoint_fp8_names = names
+        return names
+
+    # First refit only: the trainer still holds the checkpoint's weights, so what
+    # arrives can be compared with the checkpoint itself (dequantized).
+    _PROBE_RE = re.compile(
+        r"^(model\.embed_tokens\.weight|model\.norm\.weight|lm_head\.weight"
+        r"|model\.layers\.(0|3|38|77)\.(self_attn\.[a-z_.]+\.(weight|bias)"
+        r"|(input|post_attention)_layernorm\.weight"
+        r"|mlp\.(gate\.weight|gate\.e_score_correction_bias"
+        r"|(gate|up|down)_proj\.weight|shared_experts\.(gate|up|down)_proj\.weight"
+        r"|experts\.(0|1|64|65|128|129|192|193)\.(gate|up|down)_proj\.weight)))$"
+    )
+
+    def _probe_received(self, name: str, tensor: Any, scale_inv: Any) -> None:
+        if self._refits_done > 0 or self._PROBE_RE.fullmatch(name) is None:
+            return
+        if os.environ.get("NRL_TRTLLM_REFIT_PROBE", "1") == "0":
+            return
+        try:
+            from safetensors import safe_open
+
+            model_dir = self._checkpoint_dir()
+            index = getattr(self, "_probe_index", None)
+            if index is None:
+                import json
+
+                with open(
+                    os.path.join(model_dir, "model.safetensors.index.json"),
+                    encoding="utf-8",
+                ) as handle:
+                    index = self._probe_index = json.load(handle)["weight_map"]
+
+            def read(key):
+                with safe_open(os.path.join(model_dir, index[key]), framework="pt") as f:
+                    return f.get_tensor(key)
+
+            def dequantized(data, scale):
+                data = data.to(torch.float32)
+                if scale is None or data.dim() != 2:
+                    return data
+                rows, cols = data.shape
+                scale = scale.to(torch.float32)
+                return data * scale.repeat_interleave(128, 0)[:rows].repeat_interleave(
+                    128, 1
+                )[:, :cols]
+
+            reference = dequantized(
+                read(name), read(name + "_scale_inv") if name + "_scale_inv" in index else None
+            )
+            received = dequantized(
+                tensor.detach().cpu(), None if scale_inv is None else scale_inv.detach().cpu()
+            )
+            if tuple(reference.shape) != tuple(received.shape):
+                print(
+                    f"[refit probe] {name}: SHAPE received {tuple(received.shape)} "
+                    f"checkpoint {tuple(reference.shape)}",
+                    flush=True,
+                )
+                return
+            error = float((received - reference).norm() / (reference.norm() + 1e-30))
+            print(
+                f"[refit probe] {name}: rel err vs checkpoint {error:.3e} "
+                f"(|received| {float(received.abs().mean()):.3e}, "
+                f"|checkpoint| {float(reference.abs().mean()):.3e})",
+                flush=True,
+            )
+        except Exception as error:  # the probe must never break a refit
+            print(f"[refit probe] {name}: not compared: {error!r}", flush=True)
+
+    def _check_expert_slot(self, prefix: str, module: Any, module_weights: dict) -> bool:
+        """Compare one loaded expert slot with the tensor that was sent.
+
+        The MoE loader skips keys it does not know when loading partially, so a
+        naming mismatch would otherwise leave the old weights in place silently.
+        Returns True once a slot has been compared.
+        """
+        local_ids = getattr(module, "initial_local_expert_ids", None)
+        loaded_all = getattr(module, "w2_weight", None)
+        if local_ids is None or loaded_all is None:
+            return False
+        local_ids = [int(i) for i in local_ids]
+        for key, tensor in module_weights.items():
+            expert, projection, leaf = key.split(".")
+            if projection != "w2" or leaf != "weight" or int(expert) not in local_ids:
+                continue
+            slot = local_ids.index(int(expert))
+            torch.cuda.current_stream().synchronize()
+            loaded = loaded_all.data[slot]
+            if (
+                loaded.numel() != tensor.numel()
+                or loaded.element_size() != tensor.element_size()
+            ):
+                print(
+                    f"[refit] expert slot check skipped for {prefix}: loaded "
+                    f"{tuple(loaded.shape)} {loaded.dtype} vs sent "
+                    f"{tuple(tensor.shape)} {tensor.dtype}",
+                    flush=True,
+                )
+                return True
+            same = torch.equal(
+                loaded.contiguous().view(torch.uint8).reshape(-1),
+                tensor.to(loaded.device).contiguous().view(torch.uint8).reshape(-1),
+            )
+            if not same:
+                raise RuntimeError(
+                    f"refit: {prefix} expert {expert} (slot {slot}) does not hold "
+                    "the weight that was just loaded into it"
+                )
+            print(
+                f"[refit] expert slot check passed: {prefix} expert {expert} -> "
+                f"slot {slot}, {tuple(loaded.shape)} {loaded.dtype}",
+                flush=True,
+            )
+            return True
+        return False
+
+    def _flush_staged_weights(self) -> None:
+        """Load the staged non-expert weights with the model's own loader."""
+        staged, self._staged_misc_weights = self._staged_misc_weights, None
+        expert_tensors, self._direct_expert_tensors = self._direct_expert_tensors, 0
+        self._expert_slot_checked = False
+        if staged is None and expert_tensors == 0:
+            return
+        self._refits_done += 1
+        if not staged or expert_tensors == 0:
+            raise RuntimeError(
+                "refit for a model without partial loading needs both routed-expert "
+                f"and other weights; got {expert_tensors} expert tensors and "
+                f"{len(staged or {})} others"
+            )
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+            DeepseekV3ForCausalLM,
+            DeepseekV3WeightLoader,
+        )
+
+        model = self.engine.model_engine.model
+        if not isinstance(model, DeepseekV3ForCausalLM):
+            raise NotImplementedError(
+                f"refit without partial loading is implemented for the DeepSeek V3 "
+                f"load path only, not {type(model).__name__}"
+            )
+        if fp8_quantization.is_fp8_model(model.model_config.quant_config):
+            # Under block FP8 the loader always dequantizes kv_b_proj and reads a
+            # block scale next to it. The trainer sends BF16, so give it unit
+            # scales: the weight passes through unchanged.
+            for name in [n for n in staged if n.endswith(".kv_b_proj.weight")]:
+                scale_name = name + "_scale_inv"
+                if scale_name not in staged:
+                    rows, cols = staged[name].shape
+                    staged[scale_name] = torch.ones(
+                        (math.ceil(rows / 128), math.ceil(cols / 128)),
+                        dtype=torch.float32,
+                    )
+        print(
+            f"[refit] loading {len(staged)} staged non-expert tensors with "
+            f"DeepseekV3WeightLoader; {expert_tensors} routed-expert tensors were "
+            "loaded directly",
+            flush=True,
+        )
+        # After the first load, setup_aliases() registers every layer's input norm
+        # (and the final norm) a second time, as the previous layer's
+        # ``next_layer_layernorm``. named_modules() then reports them under that
+        # alias only, and the loader skips that name, so the norms would keep
+        # their old weights. Drop the aliases for the load; set them up again after.
+        for layer in model.model.layers:
+            if getattr(layer, "next_layer_layernorm", None) is not None:
+                layer.next_layer_layernorm = None
+        # Every module gets fresh, untransformed weights in this refit: clear the
+        # "already transformed" guards, as model_loader.reload does before a full
+        # reload. The loader writes some weights (kv_a/q_a, kv_b) straight into
+        # the parameters, which does not clear the guard by itself.
+        self.engine.model_engine.model_loader._reset_weights_transformed(model)
+        seen: set[int] = set()
+        second_names = []
+        for name, module in model.named_modules(remove_duplicate=False):
+            if id(module) in seen and len(module._parameters) > 0:
+                second_names.append(name)
+            seen.add(id(module))
+        if second_names:
+            print(
+                f"[refit] {len(second_names)} parameter-holding modules are still "
+                f"registered under a second name, e.g. {second_names[:4]}",
+                flush=True,
+            )
+        DeepseekV3WeightLoader(model).load_weights(staged, skip_modules=[".mlp.experts"])
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
+        # Compare what the engine now holds with what was sent, for every tensor
+        # the loader stores unchanged (same name, shape and dtype).
+        compared, differing = 0, []
+        for name, param in model.named_parameters():
+            sent = staged.get(name)
+            if (
+                sent is None
+                or tuple(sent.shape) != tuple(param.shape)
+                or sent.dtype != param.dtype
+            ):
+                continue
+            compared += 1
+            if not torch.equal(param.detach().cpu(), sent):
+                differing.append(name)
+        print(
+            f"[refit] parameter check: {compared} tensors compared with what was "
+            f"sent, {len(differing)} differ"
+            + (f", e.g. {differing[:6]}" if differing else ""),
+            flush=True,
+        )
+        model.setup_aliases()
+        if compared == 0 or "model.norm.weight" in differing or len(differing) * 2 > compared:
+            raise RuntimeError(
+                f"refit: the engine does not hold the weights that were sent "
+                f"({len(differing)} of {compared} compared tensors differ)"
+            )
 
     # ------------------------------------------------------------------ #
     #  nccl_reshard (shard-to-shard) refit
