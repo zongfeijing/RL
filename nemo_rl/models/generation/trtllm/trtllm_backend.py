@@ -103,6 +103,9 @@ class NcclExtension(WorkerExtension):
     _checkpoint_fp8_names: Optional[frozenset] = None
     _refits_done: int = 0
     _addresses_before: Optional[dict] = None
+    _delta_before: Optional[dict] = None
+    _sent_now: Optional[dict] = None
+    _sent_prev: Optional[dict] = None
     # nccl_reshard env knobs, parsed in prepare_nccl_reshard_refit_info.
     # Converted bytes to accumulate before one ``model_loader.reload`` call:
     # every reload walks the whole module tree, so batching keeps that host cost
@@ -216,6 +219,7 @@ class NcclExtension(WorkerExtension):
                     torch.cuda.empty_cache()
                     # Before begin_weight_update: it re-creates parameters.
                     self._addresses_before = self._tensor_addresses()
+                    self._delta_before = self._delta_snapshot()
                 self.begin_weight_update()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -228,6 +232,8 @@ class NcclExtension(WorkerExtension):
                 self._staged_misc_weights = None
                 self._direct_expert_tensors = 0
                 self._expert_slot_checked = False
+                self._delta_before = None
+                self._sent_now = None
                 self.engine.model_engine.model_loader.abort_update_weights()
                 raise
 
@@ -363,6 +369,7 @@ class NcclExtension(WorkerExtension):
         self._flush_staged_weights()
         self.finalize_weight_update()
         stale_graphs = self._release_graphs_if_tensors_moved()
+        self._report_refit_delta()
         if recompute_kv:
             # Re-prefill in-flight requests under the new weights; this
             # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
@@ -433,6 +440,7 @@ class NcclExtension(WorkerExtension):
                     fp8_data, scale_inv = fp8_quantization.cast_tensor_to_fp8_blockwise(
                         tensor
                     )
+                    self._note_sent(name, tensor, fp8_data)
                     staged[name] = fp8_data.to("cpu")
                     staged[name + "_scale_inv"] = scale_inv.to("cpu")
                     continue
@@ -582,6 +590,135 @@ class NcclExtension(WorkerExtension):
                 f"them: {error!r}",
                 flush=True,
             )
+
+    # How much of the engine a refit really changes: an evenly spaced sample of
+    # every model tensor is taken before the refit and compared, byte for byte,
+    # with the same elements after it. NRL_TRTLLM_REFIT_DELTA=0 turns it off.
+    _DELTA_SAMPLE = 32768
+
+    def _delta_sample(self, tensor):
+        """Evenly spaced elements of a tensor as raw bytes on the host: [n, itemsize]."""
+        if not tensor.is_contiguous():
+            return None
+        raw = (
+            tensor.detach()
+            .reshape(-1)
+            .view(torch.uint8)
+            .view(-1, tensor.element_size())
+        )
+        step = max(1, raw.shape[0] // self._DELTA_SAMPLE)
+        return raw[::step][: self._DELTA_SAMPLE].to("cpu", copy=True)
+
+    def _delta_snapshot(self) -> Optional[dict]:
+        """Samples of every model tensor, taken before a refit."""
+        if os.environ.get("NRL_TRTLLM_REFIT_DELTA", "1") != "1":
+            return None
+        try:
+            snapshot = {}
+            for key, _module, _kind, _name, tensor in self._tensor_slots():
+                sample = self._delta_sample(tensor)
+                if sample is not None:
+                    snapshot[key] = (str(tensor.dtype), tuple(tensor.shape), sample)
+            self._sent_now = {}
+            return snapshot
+        except Exception as error:  # a statistic must never break a refit
+            print(f"[refit delta] snapshot failed: {error!r}", flush=True)
+            return None
+
+    def _note_sent(self, name: str, tensor, fp8_data) -> None:
+        """Keep a sample of a weight as the trainer sent it, and of its FP8 codes.
+
+        Same element positions in both, so the report can say how many of the
+        values the trainer changed since the previous refit also change the
+        FP8 code the engine gets.
+        """
+        if self._sent_now is None:
+            return
+        try:
+            sample = self._delta_sample(tensor)
+            codes = None
+            if tuple(fp8_data.shape) == tuple(tensor.shape):
+                codes = self._delta_sample(fp8_data)
+            if sample is not None:
+                self._sent_now[name] = (sample, codes)
+        except Exception as error:  # a statistic must never break a refit
+            print(f"[refit delta] sent sample failed: {error!r}", flush=True)
+            self._sent_now = None
+
+    def _sent_delta(self) -> dict:
+        """label -> [tensors, elements, sent values changed, FP8 codes changed, both]."""
+        now, self._sent_now = self._sent_now, None
+        previous, self._sent_prev = self._sent_prev, now
+        groups: dict[str, list] = {}
+        if not now or not previous:
+            return groups
+        for name, (sample, codes) in now.items():
+            old = previous.get(name)
+            if old is None or old[0].shape != sample.shape:
+                continue
+            sent_changed = (sample != old[0]).any(dim=1)
+            label = re.sub("[.][0-9]+(?=[.]|$)", ".N", name)
+            group = groups.setdefault(label, [0, 0, 0, 0, 0])
+            group[0] += 1
+            group[1] += int(sample.shape[0])
+            group[2] += int(sent_changed.sum())
+            if codes is not None and old[1] is not None and old[1].shape == codes.shape:
+                code_changed = (codes != old[1]).any(dim=1)
+                group[3] += int(code_changed.sum())
+                group[4] += int((code_changed & sent_changed).sum())
+        return groups
+
+    def _report_refit_delta(self) -> None:
+        """Print how many sampled elements this refit changed, per kind of tensor."""
+        before, self._delta_before = self._delta_before, None
+        if before is None:
+            return
+        try:
+            import json
+
+            start = time.perf_counter()
+            groups: dict[str, list] = {}
+            other_layout = 0
+            for key, _module, _kind, _name, tensor in self._tensor_slots():
+                entry = before.get(key)
+                if entry is None:
+                    continue
+                dtype, shape, old = entry
+                new = None
+                if dtype == str(tensor.dtype) and shape == tuple(tensor.shape):
+                    new = self._delta_sample(tensor)
+                if new is None or new.shape != old.shape:
+                    other_layout += 1
+                    continue
+                changed = int((new != old).any(dim=1).sum())
+                # One group per dtype and module path with the indices removed.
+                label = dtype.replace("torch.", "") + " " + re.sub(
+                    "[.][0-9]+(?=[.]|$)", ".N", key
+                )
+                group = groups.setdefault(label, [0, 0, 0, 0])
+                group[0] += 1
+                group[1] += 1 if changed else 0
+                group[2] += int(old.shape[0])
+                group[3] += changed
+            print(
+                "[refit delta] "
+                + json.dumps(
+                    {
+                        "refit": self._refits_done,
+                        "other_layout": other_layout,
+                        "seconds": round(time.perf_counter() - start, 2),
+                        # label -> [tensors, tensors changed, elements sampled, elements changed]
+                        "groups": groups,
+                        # Weights the engine holds in FP8, as the trainer sent them (BF16):
+                        # label -> [tensors, elements, sent changed, FP8 code changed, both]
+                        "sent": self._sent_delta(),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except Exception as error:  # a statistic must never break a refit
+            print(f"[refit delta] comparison failed: {error!r}", flush=True)
 
     def _checkpoint_dir(self) -> Optional[str]:
         llm_args = getattr(self.engine.model_engine.model_loader, "llm_args", None)
