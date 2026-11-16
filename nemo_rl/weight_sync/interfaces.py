@@ -54,6 +54,12 @@ def initialize_refit_metadata(
 ) -> None:
     """Negotiate the wire-format metadata used by policy-to-generation refit."""
     state_dict_info = policy.prepare_refit_info()
+    import os
+
+    if os.environ.get("NRL_SKIP_REFIT", "0") == "1":
+        # Bring-up switch: nothing will be refitted, so nothing to negotiate.
+        print("NRL_SKIP_REFIT=1: not negotiating refit metadata", flush=True)
+        return
     prequant_names = generation.prepare_refit_info(state_dict_info)
     if not prequant_names:
         return

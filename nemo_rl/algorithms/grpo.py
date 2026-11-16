@@ -3156,6 +3156,10 @@ def refit_policy_generation(
     Returns:
         Scalar metrics reported by the selected weight synchronizer.
     """
+    if os.environ.get("NRL_SKIP_REFIT", "0") == "1":
+        # Bring-up switch: the generation engine keeps the weights it loaded.
+        print("NRL_SKIP_REFIT=1: skipping the generation refit", flush=True)
+        return {}
     synchronizer = getattr(policy_generation, "weight_synchronizer", None)
     if isinstance(policy_generation, SGLangGeneration) and synchronizer is None:
         # Fail loudly rather than falling through to the vLLM branches, which
