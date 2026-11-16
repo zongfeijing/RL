@@ -435,14 +435,24 @@ class TrtllmAsyncGenerationWorkerImpl:
 
         from transformers import AutoTokenizer
 
-        from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
+        from nemo_rl.data.deepseek_v41_tokenizer import (
+            maybe_wrap_deepseek_v41_tokenizer,
+        )
+        from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+            register_model_type_for_chat_template,
+            start_server,
+        )
 
+        chat_template = self.engine_cfg.get("chat_template")
+        register_model_type_for_chat_template(chat_template)
         tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True,
         )
         tokenizer_backend = check_fastokens_applied(tokenizer)
         print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
+        # The server merges default_chat_template_kwargs into every render.
+        tokenizer = maybe_wrap_deepseek_v41_tokenizer(tokenizer, chat_template)
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -469,7 +479,7 @@ class TrtllmAsyncGenerationWorkerImpl:
             ),
             tool_parser=self.engine_cfg.get("tool_parser"),
             reasoning_parser=self.engine_cfg.get("reasoning_parser"),
-            chat_template=self.engine_cfg.get("chat_template"),
+            chat_template=chat_template,
         )
         # host:port of the URL just returned; the disagg server is configured
         # with addresses, not URLs.

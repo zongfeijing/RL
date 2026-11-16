@@ -420,13 +420,18 @@ def _build_frontend_tokenizer(
     import numpy as np
     from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
+    from nemo_rl.data.deepseek_v41_tokenizer import maybe_wrap_deepseek_v41_tokenizer
     from nemo_rl.models.generation.trtllm.trtllm_http_server import (
         build_spliced_prompt_ids,
         normalize_chat_inputs,
+        register_model_type_for_chat_template,
         resolve_eos_token_ids,
     )
 
+    register_model_type_for_chat_template(chat_template)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # Same wrapping as the engine adapter, so both render identical ids.
+    tokenizer = maybe_wrap_deepseek_v41_tokenizer(tokenizer, chat_template)
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     # Same turn-ending set the engine adapter splices with.
     try:

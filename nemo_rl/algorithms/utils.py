@@ -32,6 +32,10 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
     should_use_deepseek_v4_chat_template,
 )
+from nemo_rl.data.deepseek_v41_tokenizer import (
+    get_deepseek_v41_tokenizer,
+    should_use_deepseek_v41_chat_template,
+)
 from nemo_rl.data.multimodal_utils import uses_image_placeholder
 from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
 from nemo_rl.models.policy import TokenizerConfig
@@ -461,6 +465,9 @@ def get_tokenizer(
             processor.chat_template = chat_template
 
     use_deepseek_v4_tokenizer = should_use_deepseek_v4_chat_template(tokenizer_config)
+    use_deepseek_v41_tokenizer = should_use_deepseek_v41_chat_template(
+        tokenizer_config
+    )
     chat_template_kwargs = tokenizer_config.get("chat_template_kwargs")
     if chat_template_kwargs is not None:
         assert isinstance(chat_template_kwargs, dict), (
@@ -469,6 +476,11 @@ def get_tokenizer(
     if use_deepseek_v4_tokenizer:
         print("Using vLLM 0.25.1's DeepSeek V4 chat renderer")
         tokenizer = get_deepseek_v4_tokenizer(tokenizer, chat_template_kwargs)
+        if processor is not None:
+            processor.tokenizer = tokenizer
+    elif use_deepseek_v41_tokenizer:
+        print("Using the DeepSeek V4.1 chat renderer")
+        tokenizer = get_deepseek_v41_tokenizer(tokenizer, chat_template_kwargs)
         if processor is not None:
             processor.tokenizer = tokenizer
     elif "chat_template" in tokenizer_config:
@@ -489,7 +501,10 @@ def get_tokenizer(
     else:
         print("No chat template provided, using tokenizer's default")
 
-    if chat_template_kwargs is not None and not use_deepseek_v4_tokenizer:
+    # The DeepSeek renderers bind chat_template_kwargs themselves.
+    if chat_template_kwargs is not None and not (
+        use_deepseek_v4_tokenizer or use_deepseek_v41_tokenizer
+    ):
         tokenizer.apply_chat_template = partial(
             tokenizer.apply_chat_template, **chat_template_kwargs
         )

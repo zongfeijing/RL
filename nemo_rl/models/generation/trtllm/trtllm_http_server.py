@@ -111,6 +111,20 @@ def normalize_chat_inputs(
     return dump["messages"], dump["tools"]
 
 
+def register_model_type_for_chat_template(chat_template: str | None) -> None:
+    """Teach transformers the model type behind a renderer-selecting ``chat_template``.
+
+    Stock transformers does not know the DeepSeek V4.1 checkpoint's
+    ``deepseek_v41`` model type, so ``AutoConfig`` (and, depending on the
+    transformers version, ``AutoTokenizer``) cannot load it. TRT-LLM registers
+    the type as an import side effect; call this before either loader.
+    """
+    from nemo_rl.data.deepseek_v41_tokenizer import DEEPSEEK_V41_CHAT_TEMPLATE
+
+    if chat_template == DEEPSEEK_V41_CHAT_TEMPLATE:
+        import tensorrt_llm._torch.configs  # noqa: F401
+
+
 async def build_spliced_prompt_ids(
     messages: list[dict],
     tools: "list[dict] | None",
