@@ -104,6 +104,7 @@ class NcclExtension(WorkerExtension):
     _refits_done: int = 0
     _addresses_before: Optional[dict] = None
     _delta_before: Optional[dict] = None
+    _memory_before: Optional[tuple] = None
     _sent_now: Optional[dict] = None
     _sent_prev: Optional[dict] = None
     # nccl_reshard env knobs, parsed in prepare_nccl_reshard_refit_info.
@@ -220,6 +221,7 @@ class NcclExtension(WorkerExtension):
                     # Before begin_weight_update: it re-creates parameters.
                     self._addresses_before = self._tensor_addresses()
                     self._delta_before = self._delta_snapshot()
+                    self._memory_before = self._memory_mark()
                 self.begin_weight_update()
                 packed_broadcast_consumer(
                     iterator=iter(self.state_dict_info.items()),
@@ -370,6 +372,7 @@ class NcclExtension(WorkerExtension):
         self.finalize_weight_update()
         stale_graphs = self._release_graphs_if_tensors_moved()
         self._report_refit_delta()
+        self._report_refit_memory()
         if recompute_kv:
             # Re-prefill in-flight requests under the new weights; this
             # also resets the prefix cache (NVIDIA/TensorRT-LLM#17937).
@@ -590,6 +593,64 @@ class NcclExtension(WorkerExtension):
                 f"them: {error!r}",
                 flush=True,
             )
+
+    # What a refit needs on the engine's GPU. nvidia-smi shows the card full during
+    # a refit, which may be PyTorch's cache rather than real demand, so report both:
+    # PyTorch's own peak and the memory nobody held when the refit started.
+    # NRL_TRTLLM_REFIT_MEMORY=0 turns it off.
+    def _memory_mark(self) -> Optional[tuple]:
+        """Device memory at the start of a refit; resets PyTorch's peak counters."""
+        if os.environ.get("NRL_TRTLLM_REFIT_MEMORY", "1") != "1":
+            return None
+        try:
+            free, total = torch.cuda.mem_get_info()
+            torch.cuda.reset_peak_memory_stats()
+            return (free, total, torch.cuda.memory_allocated(), torch.cuda.memory_reserved())
+        except Exception as error:  # a statistic must never break a refit
+            print(f"[refit memory] mark failed: {error!r}", flush=True)
+            return None
+
+    def _report_refit_memory(self) -> None:
+        """Print this refit's peak PyTorch memory next to what was available for it."""
+        before, self._memory_before = self._memory_before, None
+        if before is None:
+            return
+        try:
+            import json
+
+            gib = float(1024**3)
+            free_before, total, allocated_before, reserved_before = before
+            free_after, _total = torch.cuda.mem_get_info()
+            peak_allocated = torch.cuda.max_memory_allocated()
+            # What the refit could have used without failing: memory nobody held, plus
+            # the blocks PyTorch had reserved but not handed out.
+            available = free_before + (reserved_before - allocated_before)
+            needed = peak_allocated - allocated_before
+            print(
+                "[refit memory] "
+                + json.dumps(
+                    {
+                        "refit": self._refits_done,
+                        "device": torch.cuda.current_device(),
+                        "total_gib": round(total / gib, 1),
+                        "free_before_gib": round(free_before / gib, 1),
+                        "free_after_gib": round(free_after / gib, 1),
+                        "allocated_before_gib": round(allocated_before / gib, 1),
+                        "reserved_before_gib": round(reserved_before / gib, 1),
+                        "peak_allocated_gib": round(peak_allocated / gib, 1),
+                        "peak_reserved_gib": round(torch.cuda.max_memory_reserved() / gib, 1),
+                        "allocated_after_gib": round(torch.cuda.memory_allocated() / gib, 1),
+                        "reserved_after_gib": round(torch.cuda.memory_reserved() / gib, 1),
+                        "needed_gib": round(needed / gib, 1),
+                        "available_gib": round(available / gib, 1),
+                        "margin_gib": round((available - needed) / gib, 1),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except Exception as error:  # a statistic must never break a refit
+            print(f"[refit memory] report failed: {error!r}", flush=True)
 
     # How much of the engine a refit really changes: an evenly spaced sample of
     # every model tensor is taken before the refit and compared, byte for byte,
