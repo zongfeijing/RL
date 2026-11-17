@@ -251,6 +251,11 @@ def checkpoint_quant_config(model_dir: Any) -> Optional[dict[str, Any]]:
     import json
     import os
 
+    # Default layout: only the routed experts in FP8; every other weight stays
+    # BF16 in the engine, exactly as the trainer sends it.
+    # NRL_TRTLLM_FP8_LAYOUT=checkpoint selects the checkpoint's own FP8 layout.
+    if os.environ.get("NRL_TRTLLM_FP8_LAYOUT", "experts") != "checkpoint":
+        return None
     if model_dir is None:
         return None
     try:
