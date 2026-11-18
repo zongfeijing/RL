@@ -119,11 +119,19 @@ async def build_spliced_prompt_ids(
     template_kwargs: dict[str, Any],
     eos_token_ids: Collection[int] | None = None,
     chat_template: str | None = None,
+    required_prefix_token_ids: list[int] | None = None,
 ) -> list[int]:
     """Render the chat template and splice in the on-policy prefix.
 
     ``eos_token_ids`` is every token that can end a turn (see
     :func:`resolve_eos_token_ids`); ``None`` means only ``tokenizer.eos_token_id``.
+
+    ``required_prefix_token_ids`` is the request's top-level field of that
+    name: the exact prompt + generation ids of the previous call in the
+    rollout. NeMo-Gym's model server sends it when the agent harness does not
+    echo token ids on its messages (``supply_prefix_token_ids``) and then
+    checks that the returned prompt starts with it. When given and non-empty
+    it wins over the ids found on the messages, as in the vLLM server.
 
     The single source of truth for turning a conversation into engine prompt
     ids -- shared by the engine adapter's route and the disagg frontend's
@@ -162,6 +170,7 @@ async def build_spliced_prompt_ids(
             tools,
             template_kwargs,
             chat_template=chat_template,
+            required_prefix_token_ids=required_prefix_token_ids,
         )
         return replace_prefix_tokens(
             tokenizer=tokenizer,
@@ -495,6 +504,23 @@ def create_app(
         per_request_kwargs: dict[str, Any] = body.get("chat_template_kwargs") or {}
         effective_template_kwargs = {**_server_template_kwargs, **per_request_kwargs}
 
+        # NeMo-Gym's prefix supply: the previous call's prompt + generation
+        # ids, for harnesses whose messages carry no token ids.
+        required_prefix_token_ids = body.get("required_prefix_token_ids")
+        if required_prefix_token_ids is not None and not (
+            isinstance(required_prefix_token_ids, list)
+            and all(
+                isinstance(_t, int) and not isinstance(_t, bool)
+                for _t in required_prefix_token_ids
+            )
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "required_prefix_token_ids must be a list of integers"
+                },
+            )
+
         # b64 when gen_tokids_ctxbytes is set, an int array otherwise.
         supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
         if isinstance(supplied, str):
@@ -526,6 +552,7 @@ def create_app(
                         effective_template_kwargs,
                         _eos_token_ids,
                         chat_template=chat_template,
+                        required_prefix_token_ids=required_prefix_token_ids,
                     )
                     if recomputed != adj_prompt:
                         diff = next(
@@ -566,6 +593,7 @@ def create_app(
                     effective_template_kwargs,
                     _eos_token_ids,
                     chat_template=chat_template,
+                    required_prefix_token_ids=required_prefix_token_ids,
                 )
             except ValueError as e:
                 return JSONResponse(status_code=400, content={"error": str(e)})
@@ -909,15 +937,24 @@ def _compute_splice_inputs(
     tools: list[dict[str, Any]] | None,
     default_template_kwargs: dict[str, Any],
     chat_template: str | None = None,
+    required_prefix_token_ids: list[int] | None = None,
 ) -> tuple[list[int], list[int]]:
-    """Return preserved and rendered token IDs for the on-policy prefix splice."""
+    """Return preserved and rendered token IDs for the on-policy prefix splice.
+
+    An explicit, non-empty ``required_prefix_token_ids`` (the request's
+    top-level field) is used as is; otherwise the prefix is rebuilt from the
+    last assistant message that carries token ids.
+    """
     required_prefix_ids: list[int] = []
-    for _m in reversed(raw_messages):
-        if _m.get("role") == "assistant" and "prompt_token_ids" in _m:
-            required_prefix_ids = list(_m["prompt_token_ids"]) + list(
-                _m.get("generation_token_ids") or []
-            )
-            break
+    if required_prefix_token_ids:
+        required_prefix_ids = _to_int_ids(required_prefix_token_ids)
+    else:
+        for _m in reversed(raw_messages):
+            if _m.get("role") == "assistant" and "prompt_token_ids" in _m:
+                required_prefix_ids = list(_m["prompt_token_ids"]) + list(
+                    _m.get("generation_token_ids") or []
+                )
+                break
 
     _last_asst_idx = next(
         (

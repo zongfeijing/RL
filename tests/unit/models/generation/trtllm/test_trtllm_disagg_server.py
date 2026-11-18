@@ -17,7 +17,8 @@ TRT-LLM's OpenAIDisaggServer validates bodies against ``extra="forbid"``
 models, so any vLLM-only request field must be stripped before it reaches the
 route. ``required_prefix_token_ids`` (the vLLM prefix-override extension the
 MLPerf warmup sends) turned every warmup request into a 400 until it was added
-to the strip list; the TRT-LLM engine adapter ignores that field anyway.
+to the strip list; under disaggregation the on-policy prefix comes from the
+token ids echoed on the assistant messages.
 """
 
 import asyncio

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
+from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _build_prompt_token_ids,
     _build_sampling_params,
@@ -280,6 +281,92 @@ def test_prompt_and_prefix_render_use_normalized_tool_arguments():
         assert kwargs["tools"] == tools
 
 
+class _SpliceTokenizer:
+    """Renders a two-call conversation the way a harness that echoes no ids does.
+
+    The full prompt re-tokenizes the first answer as 1001; the model had
+    actually produced 220, 17. Token 2 ends a turn.
+    """
+
+    eos_token_id = 2
+
+    def apply_chat_template(self, messages, **kwargs):
+        del messages
+        if kwargs["add_generation_prompt"]:
+            return [11, 12, 13, 40, 41, 1001, 2, 50, 51, 60]
+        return [11, 12, 13, 40, 41, 1001, 2]
+
+
+_HARNESS_MESSAGES = [
+    {"role": "user", "content": "2 + 2?"},
+    {"role": "assistant", "content": " 4"},
+    {"role": "user", "content": "and 3 + 3?"},
+]
+
+
+def test_an_explicit_required_prefix_wins_over_the_ids_on_the_messages():
+    messages = _tool_call_messages()
+
+    required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+        messages,
+        messages,
+        _RecordingTokenizer(),
+        None,
+        {},
+        required_prefix_token_ids=[7, 8, 9],
+    )
+
+    assert required_prefix_ids == [7, 8, 9]
+    assert template_prefix_ids == [1, 2, 3]
+
+
+@pytest.mark.parametrize("explicit", [None, []])
+def test_a_missing_or_empty_required_prefix_falls_back_to_the_message_ids(explicit):
+    messages = _tool_call_messages()
+
+    required_prefix_ids, _ = _compute_splice_inputs(
+        messages,
+        messages,
+        _RecordingTokenizer(),
+        None,
+        {},
+        required_prefix_token_ids=explicit,
+    )
+
+    assert required_prefix_ids == [10, 11]
+
+
+def test_the_required_prefix_reaches_the_prompt_when_messages_carry_no_ids():
+    # A codex or OpenCode harness sends plain messages, so the previous call's
+    # exact tokens arrive only in the top-level field. NeMo-Gym then checks
+    # that the returned prompt starts with them.
+    tokenizer = _SpliceTokenizer()
+    previous_call = [11, 12, 13, 40, 41, 220, 17, 2]
+
+    without, _ = _compute_splice_inputs(
+        _HARNESS_MESSAGES, _HARNESS_MESSAGES, tokenizer, None, {}
+    )
+    assert without == []
+
+    required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+        _HARNESS_MESSAGES,
+        _HARNESS_MESSAGES,
+        tokenizer,
+        None,
+        {},
+        required_prefix_token_ids=previous_call,
+    )
+    prompt = replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=required_prefix_ids,
+        template_prefix_token_ids=template_prefix_ids,
+        template_token_ids=_build_prompt_token_ids(_HARNESS_MESSAGES, tokenizer),
+    )
+
+    assert prompt[: len(previous_call)] == previous_call
+    assert prompt == previous_call + [50, 51, 60]
+
+
 def test_trtllm_parser_rejects_invalid_tool_arguments():
     messages = _tool_call_messages()
     messages[1]["tool_calls"][0]["function"]["arguments"] = "not-json"
@@ -457,6 +544,7 @@ def test_the_chat_route_renders_gym_tools_in_normalized_order(monkeypatch):
         template_kwargs,
         eos_token_ids,
         chat_template=None,
+        required_prefix_token_ids=None,
     ):
         rendered["tools"] = tools
         # Stop before generation; the route answers a ValueError with a 400.
@@ -543,3 +631,69 @@ def test_the_chat_route_serves_the_profile_the_request_pins(
     with pytest.raises(expected):
         TestClient(app).post("/v1/chat/completions", json=body)
     assert served_with.get("config") is served
+
+
+def _splice_recording_app(monkeypatch, seen):
+    from nemo_rl.models.generation.trtllm import trtllm_http_server
+
+    async def fake_build(*args, required_prefix_token_ids=None, **kwargs):
+        del args, kwargs
+        seen["required_prefix_token_ids"] = required_prefix_token_ids
+        # Stop before generation; the route answers a ValueError with a 400.
+        raise ValueError("rendered")
+
+    monkeypatch.setattr(trtllm_http_server, "build_spliced_prompt_ids", fake_build)
+    return trtllm_http_server.create_app(
+        llm=SimpleNamespace(_hf_model_config=object(), _generation_config=None),
+        tokenizer=SimpleNamespace(eos_token_id=0),
+        model_name="m",
+        max_seq_len=16,
+        sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        val_sampling_config={"temperature": 1.0, "top_p": 1.0, "top_k": None},
+        tool_parser="qwen3",
+    )
+
+
+def test_the_chat_route_hands_the_top_level_required_prefix_to_the_splice(
+    monkeypatch,
+):
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from fastapi.testclient import TestClient
+
+    seen = {}
+    app = _splice_recording_app(monkeypatch, seen)
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "required_prefix_token_ids": [5, 6, 7],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "rendered"}
+    assert seen == {"required_prefix_token_ids": [5, 6, 7]}
+
+
+@pytest.mark.parametrize("bad", ["5,6", [5, "6"], [1.5], [True], {"ids": [5]}])
+def test_the_chat_route_rejects_a_malformed_required_prefix(monkeypatch, bad):
+    pytest.importorskip("tensorrt_llm.serve.openai_protocol")
+    from fastapi.testclient import TestClient
+
+    seen = {}
+    app = _splice_recording_app(monkeypatch, seen)
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "required_prefix_token_ids": bad,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "required_prefix_token_ids" in response.json()["error"]
+    assert seen == {}

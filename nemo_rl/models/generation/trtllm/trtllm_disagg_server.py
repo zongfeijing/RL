@@ -94,10 +94,11 @@ def build_config(
 
 # Request fields clients send for vLLM that TRT-LLM's ChatCompletionRequest
 # does not declare. Its models are extra="forbid", so leaving them in means a
-# 422/400 on every request. `required_prefix_token_ids` is the vLLM server's
-# prefix-override extension (used by the MLPerf warmup); the TRT-LLM engine
-# adapter derives the on-policy prefix from the assistant messages instead and
-# ignores the top-level field, so dropping it here keeps both paths identical.
+# 422/400 on every request. `required_prefix_token_ids` is the prefix
+# override NeMo-Gym's prefix supply and the MLPerf warmup send. The engine
+# adapter's own chat route honors it; TRT-LLM's request model cannot carry it
+# through this frontend, so it is dropped here and under disaggregation the
+# on-policy prefix comes only from token ids echoed on the assistant messages.
 #
 # `parallel_tool_calls` is not a vLLM extension but an OpenAI-standard
 # chat-completions field; TRT-LLM's ChatCompletionRequest declares `tools` and
