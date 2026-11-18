@@ -34,7 +34,9 @@ from nemo_rl.models.generation.trtllm.trtllm_http_server import (
     _parse_disaggregated_params,
     _prompt_opens_reasoning,
     _resolve_tool_parser_name,
+    _spliced_prompt_ids,
     _tokens_for_response_text,
+    _turn_closing_marker,
 )
 
 pytestmark = pytest.mark.trtllm
@@ -365,6 +367,515 @@ def test_the_required_prefix_reaches_the_prompt_when_messages_carry_no_ids():
 
     assert prompt[: len(previous_call)] == previous_call
     assert prompt == previous_call + [50, 51, 60]
+
+
+class _MarkerClosedTokenizer:
+    """A template with no end-of-turn token of its own, as GLM's.
+
+    1 opens the prompt, 7 opens a user message, 9 a tool block, 6 a system
+    message and 8 an assistant turn. 7 and 9 are also what the model emits to
+    stop, so they end a turn, and so does 2; 6 and 8 do not. The re-rendered
+    first answer is 1001; the model had actually produced 220, 17 and then
+    stopped on 9.
+    """
+
+    eos_token_id = 2
+    eos_token_ids = (2, 7, 9)
+    text = {1: "[bos]", 6: "<system>", 7: "<user>", 8: "<assistant>", 9: "<tool>"}
+
+    def __init__(self, drop_reasoning_once_more_follows=False):
+        self.drop_reasoning_once_more_follows = drop_reasoning_once_more_follows
+
+    def apply_chat_template(self, messages, **kwargs):
+        ids = [1]
+        for index, message in enumerate(messages):
+            last = index == len(messages) - 1
+            if message["role"] == "user":
+                ids += [7, 40, 41] if index == 0 else [7, 70]
+            elif message["role"] == "system":
+                ids += [6, 80]
+            elif message["role"] == "tool":
+                ids += [9, 50, 51]
+            elif self.drop_reasoning_once_more_follows and not last:
+                ids += [8]
+            else:
+                ids += [8, 1001]
+        return ids + ([8] if kwargs["add_generation_prompt"] else [])
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(self.text.get(t, f"w{t}") for t in token_ids)
+
+
+class _ChatMLTokenizer:
+    """A template that closes every message itself: 3 opens one, 2 and a newline end it.
+
+    ``trailing_prompt`` renders the assistant header after the last message
+    even without a generation prompt, as some templates do. ``assistant_end``
+    ends assistant messages with another token than the other roles, one the
+    server does not know as an end-of-turn token.
+    """
+
+    eos_token_id = 2
+    eos_token_ids = (2,)
+    roles = {"system": 30, "user": 31, "assistant": 32, "tool": 33}
+
+    def __init__(self, trailing_prompt=False, assistant_end=2):
+        self.trailing_prompt = trailing_prompt
+        self.assistant_end = assistant_end
+
+    def apply_chat_template(self, messages, **kwargs):
+        ids = []
+        for index, message in enumerate(messages):
+            answer = message["role"] == "assistant"
+            body = [1001] if answer else [100 + index]
+            end = self.assistant_end if answer else 2
+            ids += [3, self.roles[message["role"]]] + body + [end, 99]
+        if kwargs["add_generation_prompt"] or self.trailing_prompt:
+            ids += [3, 32]
+        return ids
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join("\n" if t == 99 else f"w{t}" for t in token_ids)
+
+
+_FIRST_CALL = [1, 7, 40, 41, 8, 220, 17, 9]
+_TOOL_SESSION = [
+    {"role": "user", "content": "list the files"},
+    {"role": "assistant", "content": "calling ls"},
+    {"role": "tool", "content": "a.py"},
+]
+
+
+def _prompt(tokenizer, messages, previous_call):
+    return _spliced_prompt_ids(
+        messages,
+        messages,
+        tokenizer,
+        None,
+        {},
+        tokenizer.eos_token_ids,
+        required_prefix_token_ids=previous_call,
+    )
+
+
+def test_a_turn_closed_by_the_next_role_marker_is_not_replayed():
+    # GLM has no end-of-turn token: <|observation|> or <|user|> closes the
+    # assistant turn. Counting only the markers before the turn cut the full
+    # render one block early and appended the previous exchange a second time:
+    # _FIRST_CALL + [40, 41, 8, 1001, 9, 50, 51, 8].
+    prompt = _prompt(_MarkerClosedTokenizer(), _TOOL_SESSION, _FIRST_CALL)
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def test_a_user_message_closes_the_turn_like_a_tool_block():
+    messages = _TOOL_SESSION[:2] + [{"role": "user", "content": "thanks"}]
+    stopped_on_user = [1, 7, 40, 41, 8, 220, 17, 7]
+
+    prompt = _prompt(_MarkerClosedTokenizer(), messages, stopped_on_user)
+
+    assert prompt == stopped_on_user + [70, 8]
+
+
+def test_the_closing_marker_is_found_when_history_renders_differently():
+    # GLM can drop the reasoning of earlier turns once more messages follow,
+    # so the rendered prefix is not a prefix of the full render.
+    tokenizer = _MarkerClosedTokenizer(drop_reasoning_once_more_follows=True)
+
+    prompt = _prompt(tokenizer, _TOOL_SESSION, _FIRST_CALL)
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def test_a_generation_cut_off_before_its_stop_takes_the_templates_marker():
+    hit_the_token_limit = _FIRST_CALL[:-1]
+
+    prompt = _prompt(_MarkerClosedTokenizer(), _TOOL_SESSION, hit_the_token_limit)
+
+    assert prompt == hit_the_token_limit + [9, 50, 51, 8]
+
+
+@pytest.mark.parametrize("stop", [7, 2])
+def test_a_message_keeps_its_marker_when_the_model_stopped_on_another(stop):
+    # The model ended on <|user|> or <|endoftext|> and a tool block follows:
+    # its token stays (the prefix is verbatim) and the block keeps its marker.
+    stopped_elsewhere = _FIRST_CALL[:-1] + [stop]
+
+    prompt = _prompt(_MarkerClosedTokenizer(), _TOOL_SESSION, stopped_elsewhere)
+
+    assert prompt == stopped_elsewhere + [9, 50, 51, 8]
+
+
+@pytest.mark.parametrize("first_stop", [9, 7])
+def test_several_calls_stay_one_growing_sequence(first_stop):
+    # What Gym's prefix check and the trainer's token walk rely on: every
+    # prompt is the previous call plus the rendering of the new messages.
+    # With a first turn that stopped on <|user|>, its stop token and the tool
+    # block's marker both stay in the sequence, and the rule keeps applying.
+    tokenizer = _MarkerClosedTokenizer()
+    messages = list(_TOOL_SESSION)
+    previous_call = _FIRST_CALL[:-1] + [first_stop]
+    for call in range(3):
+        marker = [9] if call == 0 and first_stop != 9 else []
+        prompt = _prompt(tokenizer, messages, previous_call)
+        assert prompt == previous_call + marker + [50, 51, 8]
+        previous_call = prompt + [221, 9]
+        messages += [
+            {"role": "assistant", "content": "again"},
+            {"role": "tool", "content": "a.py"},
+        ]
+
+
+@pytest.mark.parametrize("trailing_prompt", [False, True])
+def test_a_template_that_closes_the_assistant_message_is_left_alone(trailing_prompt):
+    # ChatML ends the assistant message with <|im_end|> and a newline. The
+    # second variant goes on to render the next header: the rendered prefix
+    # then does not end on the end-of-turn token, yet the turn is closed.
+    tokenizer = _ChatMLTokenizer(trailing_prompt=trailing_prompt)
+    system_and_user = [3, 31, 100, 2, 99, 3, 32]
+    previous_call = system_and_user + [220, 17, 2]
+
+    prompt = _prompt(tokenizer, _TOOL_SESSION, previous_call)
+
+    assert prompt == previous_call + [99, 3, 33, 102, 2, 99, 3, 32]
+
+
+def test_a_marker_that_ends_a_later_message_is_not_counted():
+    # The template closes the assistant message with a token the server does
+    # not have in its end-of-turn set (Llama 3.1's <|eom_id|> when only
+    # <|eot_id|> is known). The next end-of-turn token then ends the tool
+    # message; counting it would cut that message out of the prompt.
+    tokenizer = _ChatMLTokenizer(assistant_end=5)
+    previous_call = [3, 31, 100, 2, 99, 3, 32, 220, 17, 5]
+    full = _build_prompt_token_ids(_TOOL_SESSION, tokenizer)
+    _, rendered_prefix = _compute_splice_inputs(
+        _TOOL_SESSION, _TOOL_SESSION, tokenizer, None, {}
+    )
+
+    assert (
+        _turn_closing_marker(
+            previous_call,
+            rendered_prefix,
+            full,
+            frozenset(tokenizer.eos_token_ids),
+            tokenizer,
+        )
+        is None
+    )
+    prompt = _prompt(tokenizer, _TOOL_SESSION, previous_call)
+    assert prompt[: len(previous_call)] == previous_call
+    assert prompt[-7:] == [3, 33, 102, 2, 99, 3, 32]
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        # Nothing follows the assistant turn.
+        _TOOL_SESSION[:2],
+        # A system message opens with a marker that does not end a turn.
+        _TOOL_SESSION[:2] + [{"role": "system", "content": "note"}] + _TOOL_SESSION[2:],
+    ],
+)
+def test_a_turn_with_no_closing_marker_after_it_keeps_the_old_splice(messages):
+    tokenizer = _MarkerClosedTokenizer()
+    full = _build_prompt_token_ids(messages, tokenizer)
+    _, rendered_prefix = _compute_splice_inputs(messages, messages, tokenizer, None, {})
+
+    assert (
+        _turn_closing_marker(
+            _FIRST_CALL,
+            rendered_prefix,
+            full,
+            frozenset(tokenizer.eos_token_ids),
+            tokenizer,
+        )
+        is None
+    )
+    # The previous exchange comes back, as before; no new message is lost.
+    assert _prompt(tokenizer, messages, _FIRST_CALL)[: len(_FIRST_CALL)] == _FIRST_CALL
+    assert _prompt(tokenizer, messages, _FIRST_CALL)[-len(full) + 2 :] == full[2:]
+
+
+def test_whatever_marker_follows_the_open_turn_closes_it():
+    # Not a matter of roles: here the system marker (6) ends a turn too, and
+    # the system message keeps it after the model's own stop token.
+    tokenizer = _MarkerClosedTokenizer()
+    messages = (
+        _TOOL_SESSION[:2] + [{"role": "system", "content": "note"}] + _TOOL_SESSION[2:]
+    )
+
+    prompt = _spliced_prompt_ids(
+        messages,
+        messages,
+        tokenizer,
+        None,
+        {},
+        (2, 6, 7, 9),
+        required_prefix_token_ids=_FIRST_CALL,
+    )
+
+    assert prompt == _FIRST_CALL + [6, 80, 9, 50, 51, 8]
+
+
+def test_no_further_end_of_turn_token_means_no_marker():
+    marker = _turn_closing_marker(
+        _FIRST_CALL,
+        [1, 7, 40, 41, 8, 1001],
+        [1, 7, 40, 41, 8, 1001, 50, 51, 8],
+        frozenset((2, 7, 9)),
+        _MarkerClosedTokenizer(),
+    )
+
+    assert marker is None
+
+
+def test_the_open_turn_check_reads_the_tokens_in_order():
+    # The same tokens in another order are another message, not the open turn.
+    marker = _turn_closing_marker(
+        _FIRST_CALL,
+        [1, 7, 40, 41, 8, 1001],
+        [1, 7, 41, 40, 8, 1001, 9, 50, 8],
+        frozenset((2, 7, 9)),
+        _MarkerClosedTokenizer(),
+    )
+
+    assert marker is None
+
+
+def test_whitespace_after_the_end_of_turn_token_does_not_reopen_the_turn():
+    # ChatML with the message opener (3) also in the end-of-turn set, say
+    # <|im_start|> listed as a stop token: the newline after <|im_end|> must
+    # not make the turn look open, or the next opener would be counted and
+    # the newline cut.
+    previous_call = [3, 31, 100, 2, 99, 3, 32, 220, 17, 2]
+
+    prompt = _spliced_prompt_ids(
+        _TOOL_SESSION,
+        _TOOL_SESSION,
+        _ChatMLTokenizer(),
+        None,
+        {},
+        (2, 3),
+        required_prefix_token_ids=previous_call,
+    )
+
+    assert prompt == previous_call + [99, 3, 33, 102, 2, 99, 3, 32]
+
+
+def test_a_long_open_turn_is_not_decoded():
+    # GLM's real case: far more than a few tokens follow the last end-of-turn
+    # token, so the turn is open without asking the tokenizer.
+    class _LongTurn(_MarkerClosedTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            ids = super().apply_chat_template(messages, **kwargs)
+            return [
+                extra
+                for t in ids
+                for extra in [t] + (list(range(300, 312)) if t == 1001 else [])
+            ]
+
+        def decode(self, token_ids, skip_special_tokens=False):
+            raise AssertionError("decode called for a long tail")
+
+    prompt = _prompt(_LongTurn(), _TOOL_SESSION, _FIRST_CALL)
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+@pytest.mark.parametrize("eos_token_ids", [None, set()])
+def test_without_an_end_of_turn_set_the_tokenizers_eos_closes_the_turn(eos_token_ids):
+    class _ToolMarkerIsEos(_MarkerClosedTokenizer):
+        eos_token_id = 9
+
+    prompt = _spliced_prompt_ids(
+        _TOOL_SESSION,
+        _TOOL_SESSION,
+        _ToolMarkerIsEos(),
+        None,
+        {},
+        eos_token_ids,
+        required_prefix_token_ids=_FIRST_CALL,
+    )
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def _echoed_session():
+    """The session as a harness that echoes token ids on its messages sends it."""
+    return [
+        _TOOL_SESSION[0],
+        {
+            **_TOOL_SESSION[1],
+            "prompt_token_ids": [1, 7, 40, 41, 8],
+            "generation_token_ids": [220, 17, 9],
+        },
+        _TOOL_SESSION[2],
+    ]
+
+
+def test_ids_echoed_on_the_last_assistant_message_close_the_turn():
+    # NeMo-Gym's own harnesses echo the ids on the messages. The parser's
+    # conversation has them stripped, so the two lists differ.
+    tokenizer = _MarkerClosedTokenizer()
+    raw_messages = _echoed_session()
+    conversation = [
+        {k: v for k, v in m.items() if not k.endswith("_token_ids")}
+        for m in raw_messages
+    ]
+
+    prompt = _spliced_prompt_ids(
+        raw_messages, conversation, tokenizer, None, {}, tokenizer.eos_token_ids
+    )
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def test_messages_before_a_later_assistant_message_are_not_cut_out():
+    # The top-level prefix ends at the model's turn, but the harness appended
+    # an assistant message of its own after the tool result. The rendered
+    # prefix then shows a turn the model's tokens do not have; closing the
+    # last turn would drop the tool result and the harness's message.
+    tokenizer = _MarkerClosedTokenizer()
+    messages = _TOOL_SESSION + [
+        {"role": "assistant", "content": "written by the harness"},
+        {"role": "tool", "content": "a.py"},
+    ]
+
+    prompt = _prompt(tokenizer, messages, _FIRST_CALL)
+
+    assert prompt == _FIRST_CALL + [50, 51, 8, 1001, 9, 50, 51, 8]
+
+
+@pytest.mark.parametrize(
+    "extra_messages, reason",
+    [
+        # A system message between the open turn and the next marker.
+        ([{"role": "system", "content": "note"}, _TOOL_SESSION[2]], "directly follow"),
+        # A tool result and an assistant message the harness wrote.
+        (
+            [
+                _TOOL_SESSION[2],
+                {"role": "assistant", "content": "written by the harness"},
+                _TOOL_SESSION[2],
+            ],
+            "messages lie between",
+        ),
+    ],
+)
+def test_a_marker_that_is_turned_down_is_reported_once(
+    monkeypatch, caplog, extra_messages, reason
+):
+    # The replay that comes back is silent otherwise: the prompt still starts
+    # with the previous call.
+    from nemo_rl.models.generation.trtllm import trtllm_http_server
+
+    monkeypatch.setattr(trtllm_http_server, "_reported_splice_fallbacks", set())
+    messages = _TOOL_SESSION[:2] + extra_messages
+
+    with caplog.at_level("WARNING", logger=trtllm_http_server.__name__):
+        for _ in range(2):
+            _prompt(_MarkerClosedTokenizer(), messages, _FIRST_CALL)
+
+    reports = [r.getMessage() for r in caplog.records if "Prefix splice" in r.message]
+    assert len(reports) == 1
+    assert reason in reports[0]
+
+
+def test_ids_on_an_earlier_assistant_message_keep_the_old_splice():
+    # The prefix found on the messages ends at the first answer, the rendered
+    # prefix at the second: closing the second turn would drop what lies
+    # between them.
+    tokenizer = _MarkerClosedTokenizer()
+    messages = [
+        _TOOL_SESSION[0],
+        {
+            **_TOOL_SESSION[1],
+            "prompt_token_ids": [1, 7, 40, 41, 8],
+            "generation_token_ids": [220, 17, 9],
+        },
+        _TOOL_SESSION[2],
+        {"role": "assistant", "content": "no ids on this one"},
+        {"role": "tool", "content": "a.py"},
+    ]
+
+    prompt = _spliced_prompt_ids(
+        messages, messages, tokenizer, None, {}, tokenizer.eos_token_ids
+    )
+
+    # The cut is the second marker of the full render, the one before the
+    # first tool block, as it was before the turn-closing rule.
+    assert prompt == _FIRST_CALL + [50, 51, 8, 1001, 9, 50, 51, 8]
+
+
+def _build_through_the_parser(tokenizer, messages, **kwargs):
+    """build_spliced_prompt_ids, the function both routes call, with the real parser."""
+    pytest.importorskip("tensorrt_llm.serve.chat_utils")
+    transformers = pytest.importorskip("transformers")
+    from nemo_rl.models.generation.trtllm.trtllm_http_server import (
+        build_spliced_prompt_ids,
+    )
+
+    kwargs.setdefault("tools", None)
+    kwargs.setdefault("template_kwargs", {})
+    return asyncio.run(
+        build_spliced_prompt_ids(
+            messages,
+            kwargs.pop("tools"),
+            tokenizer,
+            transformers.PretrainedConfig(),
+            kwargs.pop("template_kwargs"),
+            tokenizer.eos_token_ids,
+            **kwargs,
+        )
+    )
+
+
+def test_the_spliced_prompt_is_built_through_the_parser():
+    prompt = _build_through_the_parser(
+        _MarkerClosedTokenizer(), _TOOL_SESSION, required_prefix_token_ids=_FIRST_CALL
+    )
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def test_the_parser_route_reads_ids_from_the_raw_messages():
+    # Raw messages for the echoed ids, the parsed conversation for the render.
+    class _Strict(_MarkerClosedTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            assert all("prompt_token_ids" not in m for m in messages)
+            return super().apply_chat_template(messages, **kwargs)
+
+    prompt = _build_through_the_parser(_Strict(), _echoed_session())
+
+    assert prompt == _FIRST_CALL + [50, 51, 8]
+
+
+def test_render_arguments_reach_both_renders():
+    seen = []
+
+    class _Recording(_MarkerClosedTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            seen.append(kwargs)
+            return super().apply_chat_template(messages, **kwargs)
+
+    tools = [{"type": "function", "function": {"name": "ls"}}]
+
+    _build_through_the_parser(
+        _Recording(),
+        _TOOL_SESSION,
+        tools=tools,
+        template_kwargs={"clear_thinking": True},
+        chat_template="TEMPLATE",
+        required_prefix_token_ids=_FIRST_CALL,
+    )
+
+    assert sorted(kwargs["add_generation_prompt"] for kwargs in seen) == [False, True]
+    for kwargs in seen:
+        assert kwargs["tools"] == tools
+        assert kwargs["clear_thinking"] is True
+        assert kwargs["chat_template"] == "TEMPLATE"
 
 
 def test_trtllm_parser_rejects_invalid_tool_arguments():

@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI, Request
 
 from nemo_rl.models.generation.openai_server_utils import (
-    replace_prefix_tokens,
+    splice_prefix_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,10 @@ async def build_spliced_prompt_ids(
     rollout. NeMo-Gym's model server sends it when the agent harness does not
     echo token ids on its messages (``supply_prefix_token_ids``) and then
     checks that the returned prompt starts with it. When given and non-empty
-    it wins over the ids found on the messages, as in the vLLM server.
+    it wins over the ids found on the messages, as in the vLLM server. It must
+    be the call whose answer is the conversation's last assistant message: an
+    assistant message a harness writes after the model's turn cannot be told
+    from the model's own.
 
     The single source of truth for turning a conversation into engine prompt
     ids -- shared by the engine adapter's route and the disagg frontend's
@@ -154,30 +157,15 @@ async def build_spliced_prompt_ids(
         )
 
     def _sync() -> list[int]:
-        # Full retokenization avoids accumulating generation token IDs twice.
-        prompt_token_ids = _build_prompt_token_ids(
-            conversation,
-            tokenizer,
-            tools=tools,
-            default_template_kwargs=template_kwargs,
-            chat_template=chat_template,
-        )
-        # Empty required_prefix_ids on turn one returns the template unchanged.
-        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+        return _spliced_prompt_ids(
             messages,
             conversation,
             tokenizer,
             tools,
             template_kwargs,
+            eos_token_ids,
             chat_template=chat_template,
             required_prefix_token_ids=required_prefix_token_ids,
-        )
-        return replace_prefix_tokens(
-            tokenizer=tokenizer,
-            model_prefix_token_ids=required_prefix_ids,
-            template_prefix_token_ids=template_prefix_ids,
-            template_token_ids=prompt_token_ids,
-            eos_token_id=eos_token_ids or None,
         )
 
     return await asyncio.to_thread(_sync)
@@ -982,6 +970,258 @@ def _compute_splice_inputs(
         tokenizer.apply_chat_template(_msgs_to_last_asst, **_prefix_tkw)
     )
     return required_prefix_ids, template_prefix_ids
+
+
+def _spliced_prompt_ids(
+    raw_messages: list[dict[str, Any]],
+    conversation: list[dict[str, Any]],
+    tokenizer: Any,
+    tools: list[dict[str, Any]] | None,
+    template_kwargs: dict[str, Any],
+    eos_token_ids: Collection[int] | None,
+    chat_template: str | None = None,
+    required_prefix_token_ids: list[int] | None = None,
+) -> list[int]:
+    """Render ``conversation`` and splice in the on-policy prefix (blocking)."""
+    # Full retokenization avoids accumulating generation token IDs twice.
+    prompt_token_ids = _build_prompt_token_ids(
+        conversation,
+        tokenizer,
+        tools=tools,
+        default_template_kwargs=template_kwargs,
+        chat_template=chat_template,
+    )
+    # Empty required_prefix_ids on turn one returns the template unchanged.
+    required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+        raw_messages,
+        conversation,
+        tokenizer,
+        tools,
+        template_kwargs,
+        chat_template=chat_template,
+        required_prefix_token_ids=required_prefix_token_ids,
+    )
+    closing_marker = None
+    if required_prefix_ids and _prefix_ends_at_last_assistant(
+        raw_messages, required_prefix_token_ids
+    ):
+        closing_marker = _turn_closing_marker(
+            required_prefix_ids,
+            template_prefix_ids,
+            prompt_token_ids,
+            _end_of_turn_ids(eos_token_ids, tokenizer),
+            tokenizer,
+        )
+    if closing_marker is not None:
+        template_prefix_ids = template_prefix_ids + [closing_marker]
+    splice = splice_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=required_prefix_ids,
+        template_prefix_token_ids=template_prefix_ids,
+        template_token_ids=prompt_token_ids,
+        eos_token_id=eos_token_ids or None,
+    )
+    token_ids = splice.token_ids
+    boundary = splice.model_cut_end
+    if closing_marker is not None and token_ids[boundary] != closing_marker:
+        # The model ended its turn on another end-of-turn token than the one
+        # that opens the next message (say <|user|> or <|endoftext|> before a
+        # tool block). Its token stays, the prefix is verbatim, and the
+        # message keeps its own marker instead of sitting under the model's.
+        token_ids = (
+            token_ids[: boundary + 1] + [closing_marker] + token_ids[boundary + 1 :]
+        )
+    return token_ids
+
+
+# A longer run of tokens after the last end-of-turn token is not whitespace;
+# it bounds the decode in _assistant_turn_left_open.
+_MAX_TRAILING_WHITESPACE_TOKENS = 8
+
+
+def _end_of_turn_ids(
+    eos_token_ids: Collection[int] | int | None, tokenizer: Any
+) -> frozenset[int]:
+    """The end-of-turn set the way ``splice_prefix_tokens`` reads its ``eos_token_id``.
+
+    ``None`` or an empty collection means the tokenizer's own EOS, which may
+    be one id, several, or missing.
+    """
+    if eos_token_ids is None or (
+        not isinstance(eos_token_ids, int) and not eos_token_ids
+    ):
+        eos_token_ids = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_ids is None:
+        return frozenset()
+    if isinstance(eos_token_ids, int):
+        return frozenset((eos_token_ids,))
+    return frozenset(eos_token_ids)
+
+
+def _prefix_ends_at_last_assistant(
+    raw_messages: list[dict[str, Any]],
+    required_prefix_token_ids: list[int] | None,
+) -> bool:
+    """Whether the on-policy prefix ends with the conversation's last assistant turn.
+
+    The request's top-level prefix is the previous call, whose answer is that
+    turn. Ids echoed on the messages may sit on an earlier assistant message
+    than the last one; the rendered prefix then covers more than the model's
+    tokens, and the splice is left as it was. That includes one turn echoed
+    as several assistant messages with the ids not on the last of them: the
+    messages after the ids cannot be told from ones the harness wrote.
+    """
+    if required_prefix_token_ids:
+        return True
+    last_assistant = next(
+        (m for m in reversed(raw_messages) if m.get("role") == "assistant"), None
+    )
+    return last_assistant is not None and "prompt_token_ids" in last_assistant
+
+
+def _assistant_turn_left_open(
+    template_prefix_ids: list[int], eos_token_ids: frozenset[int], tokenizer: Any
+) -> bool:
+    """Whether the render through the last assistant message stops inside that turn.
+
+    ChatML-style templates close every message with an end-of-turn token, so
+    the render ends on one, at most followed by whitespace. GLM-style templates
+    have no such token: the next message's role marker closes the turn, and
+    the render ends on the assistant's own text.
+    """
+    last_eos = next(
+        (
+            i
+            for i in range(len(template_prefix_ids) - 1, -1, -1)
+            if template_prefix_ids[i] in eos_token_ids
+        ),
+        -1,
+    )
+    tail = template_prefix_ids[last_eos + 1 :]
+    if not tail:
+        return False
+    if len(tail) > _MAX_TRAILING_WHITESPACE_TOKENS:
+        return True
+    return bool(tokenizer.decode(tail, skip_special_tokens=False).strip())
+
+
+def _turn_closing_marker(
+    model_prefix_ids: list[int],
+    template_prefix_ids: list[int],
+    prompt_token_ids: list[int],
+    eos_token_ids: frozenset[int],
+    tokenizer: Any,
+) -> int | None:
+    """The token that closes the last assistant turn, if the template leaves it open.
+
+    ``splice_prefix_tokens`` finds the end of the model's last turn in the
+    full render by counting the end-of-turn tokens of the rendered prefix. That
+    lands on the right token when the template closes the assistant message
+    itself (ChatML's ``<|im_end|>``). GLM's template does not: an assistant
+    turn ends at the next message's ``<|user|>`` or ``<|observation|>``, which
+    are also the tokens the model emits to stop. The rendered prefix then ends
+    inside the turn, its last end-of-turn token is the marker *before* the
+    turn, and the splice appends the preceding user/tool block and a re-render
+    of the assistant turn after the model's own tokens: every call after the
+    first carries the previous exchange twice.
+
+    When the rendered prefix stops inside the turn, the token that closes it
+    is the next end-of-turn token of the full render; counted into the
+    rendered prefix it moves the cut to the real boundary. It is found by
+    count as well, not by position: templates may render earlier turns
+    differently once more messages follow (GLM can drop the reasoning of turns
+    before the last user message).
+
+    Two checks keep the marker from cutting messages out of the prompt.
+
+    The model's tokens must show every turn the rendered prefix shows. Both
+    hold one end-of-turn token per turn before the last assistant message
+    when the prefix ends with that message; the model's may hold more (a stop
+    token kept next to a marker). Fewer means messages lie between the
+    model's turn and the last assistant message, a tool result followed by an
+    assistant message the harness wrote, say. (So does the text of an
+    end-of-turn token in what the model wrote, which the template renders as
+    that token.) The model's final token is left out of the count: an
+    end-of-turn token there ends the very turn in question.
+
+    And the open turn must be all that precedes the marker in the full
+    render. Anything more means it ends a later message: a message whose role
+    opens with no end-of-turn token came in between (a system message), or
+    the template closed the assistant message with a token outside the
+    end-of-turn set, or rendered a generation prompt after it.
+
+    ``None`` keeps the splice as it was: templates that close the assistant
+    message, an assistant message that is last, and the cases the two checks
+    turn down (the previous exchange is then still replayed; nothing is
+    lost). So does an answer whose own text ends with the text of an
+    end-of-turn token, which renders like a closed turn.
+    """
+    if not eos_token_ids:
+        return None
+    if not _assistant_turn_left_open(template_prefix_ids, eos_token_ids, tokenizer):
+        return None
+
+    rendered_turn_ends = sum(tid in eos_token_ids for tid in template_prefix_ids)
+    prefix_turn_ends = sum(tid in eos_token_ids for tid in model_prefix_ids[:-1])
+    if prefix_turn_ends < rendered_turn_ends:
+        _report_splice_fallback_once(
+            "turns",
+            "the render through it shows %d end-of-turn tokens and the on-policy "
+            "prefix holds %d: messages lie between the model's turn and the last "
+            "assistant message, or the model wrote the text of such a token.",
+            rendered_turn_ends,
+            prefix_turn_ends,
+        )
+        return None
+
+    seen = 0
+    segment_start = 0
+    for position, tid in enumerate(prompt_token_ids):
+        if tid in eos_token_ids:
+            if seen == rendered_turn_ends:
+                break
+            seen += 1
+            segment_start = position + 1
+    else:
+        return None
+
+    # Since the last end-of-turn token the full render may show less than the
+    # rendered prefix does (reasoning dropped from history), never more.
+    tail_start = len(template_prefix_ids)
+    while tail_start and template_prefix_ids[tail_start - 1] not in eos_token_ids:
+        tail_start -= 1
+    open_turn = iter(template_prefix_ids[tail_start:])
+    if not all(t in open_turn for t in prompt_token_ids[segment_start:position]):
+        _report_splice_fallback_once(
+            "position",
+            "the next end-of-turn token of the full render does not directly "
+            "follow that turn (%d tokens before it, %d in the turn as rendered "
+            "alone).",
+            position - segment_start,
+            len(template_prefix_ids) - tail_start,
+        )
+        return None
+    return tid
+
+
+# Reasons already reported by _report_splice_fallback_once.
+_reported_splice_fallbacks: set[str] = set()
+
+
+def _report_splice_fallback_once(reason: str, finding: str, *args: Any) -> None:
+    """Log, once per reason, that an open assistant turn keeps the count-based cut.
+
+    Nothing else shows it: the prompt still starts with the previous call.
+    """
+    if reason in _reported_splice_fallbacks:
+        return
+    _reported_splice_fallbacks.add(reason)
+    logger.warning(
+        "Prefix splice: the chat template leaves the last assistant turn open, "
+        "but " + finding + " Keeping the count-based cut, which repeats the "
+        "previous exchange in the prompt. Logged once per process.",
+        *args,
+    )
 
 
 # ---------------------------------------------------------------------------
